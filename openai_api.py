@@ -28,8 +28,6 @@ from transformers import GenerationConfig, TextIteratorStreamer
 
 from template import get_conv_template
 
-# test
-
 
 class BasicAuthMiddleware(BaseHTTPMiddleware):
 
