@@ -11,10 +11,10 @@ import re
 from datasets import load_dataset
 import torch
 from loguru import logger
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers.trainer_utils import get_last_checkpoint
 from trl import GRPOConfig, GRPOTrainer, ModelConfig, TrlParser
-from peft import LoraConfig, TaskType
+from peft import LoraConfig, TaskType, get_peft_model
 from latex2sympy2_extended import NormalizationConfig
 from math_verify import LatexExtractionConfig, parse, verify
 
@@ -34,11 +34,11 @@ class ScriptArguments:
     )
     # Dataset arguments
     dataset_name: Optional[str] = field(
-        default="xiaodongguaAIGC/X-R1-750",
+        default="openai/gsm8k",
         metadata={"help": "The name of the dataset to use (via the datasets library)."}
     )
     train_samples: Optional[int] = field(default=-1, metadata={"help": "Number of samples to train on, -1 for all"})
-    subset_name: Optional[str] = field(default="default",
+    subset_name: Optional[str] = field(default="main",
                                        metadata={"help": "Subset name, e.g., 'default', 'main'. default is 'default'"})
     dataset_splits: Optional[str] = field(default="train", metadata={"help": "Split name"})
     preprocessing_num_workers: Optional[int] = field(default=10,
@@ -64,18 +64,22 @@ def extract_answer(text):
     return text.strip()
 
 
-def accuracy_reward(completions, solution, **kwargs):
+def accuracy_reward(completions, answer, **kwargs):
     """Reward function that checks if the completion is the same as the ground truth."""
     contents = [completion[0]["content"] for completion in completions]
     rewards = []
-    for content, sol in zip(contents, solution):
-        # First try latex parsing
-        gold_parsed = parse(
-            sol,
-            extraction_mode="first_match",
-            extraction_config=[LatexExtractionConfig()],
-        )
-        if len(gold_parsed) != 0:
+    for content, sol in zip(contents, answer):
+        if '####' in sol:
+            # for GSM8K
+            gold_parsed = parse(sol.split("####", 1)[-1].strip())
+            answer_parsed = parse(extract_answer(content))
+        else:
+            # First try latex parsing
+            gold_parsed = parse(
+                sol,
+                extraction_mode="first_match",
+                extraction_config=[LatexExtractionConfig()],
+            )
             # We require the answer to be provided in correct latex (no malformed operators)
             answer_parsed = parse(
                 content,
@@ -96,14 +100,13 @@ def accuracy_reward(completions, solution, **kwargs):
                 ],
                 extraction_mode="first_match",
             )
-            # Reward 1 if the content is the same as the ground truth, 0 otherwise
+        try:
             reward = float(verify(answer_parsed, gold_parsed))
-            logger.debug(f"predict_answer: {content}, \nground_truth: {sol}, \n"
-                         f"answer_parsed: {answer_parsed}, gold_parsed: {gold_parsed}, reward: {reward}\n\n")
-        else:
-            # If the gold solution is not parseable, we reward 1 to skip this example
-            reward = 1.0
-            logger.debug(f"Failed to parse ground_truth: {sol}")
+        except Exception as e:
+            logger.warning(f"Error in verification: {e}")
+            reward = 0.0
+        logger.debug(f"predict_answer: {content}, \nground_truth: {sol}, \n"
+                     f"answer_parsed: {answer_parsed}, gold_parsed: {gold_parsed}, reward: {reward}\n\n")
         rewards.append(reward)
     logger.debug(f'accuracy rewards: {rewards}')
     return rewards
@@ -111,7 +114,7 @@ def accuracy_reward(completions, solution, **kwargs):
 
 def format_reward(completions, **kwargs):
     """Reward function that checks if the completion has a specific format."""
-    pattern = r"^<think>.*?</think><answer>.*?</answer>$"
+    pattern = r"<think>.*?</think><answer>.*?</answer>$"
     completion_contents = [completion[0]["content"] for completion in completions]
     matches = [re.match(pattern, content) for content in completion_contents]
 
@@ -135,15 +138,9 @@ def get_checkpoint(training_args: GRPOConfig):
     return last_checkpoint
 
 
-def find_all_linear_names(peft_model, int4=False, int8=False):
+def find_all_linear_names(peft_model):
     """Find all linear layer names in the model. reference from qlora paper."""
     cls = torch.nn.Linear
-    if int4 or int8:
-        import bitsandbytes as bnb
-        if int4:
-            cls = bnb.nn.Linear4bit
-        elif int8:
-            cls = bnb.nn.Linear8bitLt
     lora_module_names = set()
     for name, module in peft_model.named_modules():
         if isinstance(module, cls):
@@ -197,9 +194,9 @@ def grpo_train(
             lambda x: {
                 'prompt': [
                     {'role': 'system', 'content': SYSTEM_PROMPT},
-                    {'role': 'user', 'content': x['problem']}
+                    {'role': 'user', 'content': x['question']}
                 ],
-                'answer': x['solution']
+                'answer': x['answer']
             },
             num_proc=script_args.preprocessing_num_workers,
             desc="Processing dataset" if is_main_process else None,
@@ -230,19 +227,25 @@ def grpo_train(
         trust_remote_code=model_args.trust_remote_code,
         attn_implementation=model_args.attn_implementation,
         torch_dtype=torch_dtype,
-        use_cache=False if training_args.gradient_checkpointing else True,
         device_map=training_args.device_map if ddp else "auto",
     )
-    training_args.model_init_kwargs = model_kwargs
+    model = AutoModelForCausalLM.from_pretrained(
+        model_args.model_name_or_path,
+        **model_kwargs,
+    )
 
     # Configure LoRA if enabled
-    peft_config = None
     if model_args.use_peft:
         if is_main_process:
             logger.info("Fine-tuning method: LoRA(PEFT)")
+        if training_args.gradient_checkpointing:
+            logger.warning("Gradient checkpointing is enabled. It may cause issues with LoRA, setting it to False.")
+            training_args.gradient_checkpointing = False
         target_modules = model_args.lora_target_modules if model_args.lora_target_modules else None
+        if target_modules == 'all' or 'all' in target_modules:
+            target_modules = find_all_linear_names(model)
         if is_main_process:
-            logger.info(f"Peft target_modules: {target_modules}")
+            logger.info(f"Peft target_modules: {target_modules}, lora rank: {model_args.lora_r}, ")
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             target_modules=target_modules,
@@ -251,12 +254,24 @@ def grpo_train(
             lora_alpha=model_args.lora_alpha,
             lora_dropout=model_args.lora_dropout,
         )
+        model = get_peft_model(model, peft_config)
+        for param in filter(lambda p: p.requires_grad, model.parameters()):
+            param.data = param.data.to(torch.float32)
+        model.print_trainable_parameters()
     else:
         logger.info("Fine-tuning method: Full parameters training")
 
+    if training_args.gradient_checkpointing and getattr(model, "supports_gradient_checkpointing", False):
+        model.gradient_checkpointing_enable()
+        model.config.use_cache = False
+        logger.info("Gradient checkpointing enabled.")
+    else:
+        model.config.use_cache = True
+        logger.info("Gradient checkpointing disabled.")
+
     # Initialize GRPO trainer with distributed training support
     trainer = GRPOTrainer(
-        model=model_args.model_name_or_path,
+        model=model,
         processing_class=tokenizer,
         reward_funcs=[
             accuracy_reward,
@@ -265,7 +280,6 @@ def grpo_train(
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=test_dataset if training_args.eval_strategy != "no" else None,
-        peft_config=peft_config,
     )
     logger.info("*** GRPO Trainer initialized ***")
     logger.debug(f"Trainer: {trainer}")
